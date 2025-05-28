@@ -1,0 +1,295 @@
+name: Docker Artifact Deployment to GCP
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: 'Name of the Docker Image to deploy.'
+        type: string
+      image_tag:
+        description: 'Tag of the Docker Image to deploy.'
+        type: string
+      artifactory_repo:
+        description: 'Bayer Artifact Repository.'
+        type: string
+      project_selection:
+        description: 'Name of the environment to perform deployment'
+        type: string
+        required: true
+      gke_namespace:
+        description: 'Namespace of target service'
+        type: string
+        default: 'default'
+  workflow_dispatch:
+    inputs:
+      image_name:
+        description: 'Name of the Docker Image to deploy.'
+        type: string
+      image_tag:
+        description: 'Tag of the Docker Image to deploy.'
+        type: string
+      artifactory_repo:
+        description: 'Bayer Artifact Repository to pull Docker Image.'
+        type: choice
+        required: false
+        options:
+          - calantic-docker-dev-local
+          - calantic-docker-release-local
+      project_selection:
+        description: 'Name of the environment to perform deployment'
+        type: choice
+        required: false
+        options:
+          - dev2
+          - dev-na
+          - qa
+          - qa-na
+          - idev-na
+          - uat-na
+          - uat
+          - prod-na
+      gke_namespace:
+        description: 'Namespace of target service'
+        type: string
+        default: 'default'
+
+env:
+  artifactory_user: calantic-dev
+  docker_artifact_registry: calantic-internal
+  manifest_secret: deployment-manifest
+  PARAM_MAP: |
+    {
+      "^dev2$": {
+        "cluster_name": "cng-gke",
+        "tag_name": "dev2-customer",
+        "region": "us-west1",
+        "artifact_registry_region": "us",
+        "project_id": "",
+        "regional_project_id": ""
+      },
+      "^dev-na$": {
+        "cluster_name": "cng-api-gke",
+        "tag_name": "dev-na",
+        "region": "us-west1",
+        "artifact_registry_region": "us",
+        "project_id": "",
+        "regional_project_id": ""
+      },
+      "^qa$": {
+        "cluster_name": "cng-gke",
+        "tag_name": "qa-customer",
+        "region": "us-west1",
+        "artifact_registry_region": "us",
+        "project_id": "",
+        "regional_project_id": "",
+        "approvers":"calantic-qa-deployers"
+      },
+      "^qa-na$": {
+        "cluster_name": "cng-api-gke",
+        "tag_name": "qa-na",
+        "region": "us-west1",
+        "artifact_registry_region": "us",
+        "project_id": "",
+        "regional_project_id": "",
+        "approvers":"calantic-qa-deployers"
+      },
+      "^idev$": {
+        "cluster_name": "cng-gke",
+        "tag_name": "idev-customer",
+        "region": "us-west1",
+        "artifact_registry_region": "us",
+        "project_id": "",
+        "regional_project_id": ""
+      },
+      "^idev-na$": {
+        "cluster_name": "cng-api-gke",
+        "tag_name": "idev-na",
+        "region": "us-west1",
+        "artifact_registry_region": "us",
+        "project_id": "",
+        "regional_project_id": ""
+      },
+      "^uat-na$": {
+        "cluster_name": "cng-api-gke",
+        "tag_name": "uat-na",
+        "region": "us-west1",
+        "artifact_registry_region": "us",
+        "project_id": "",
+        "regional_project_id": "",
+        "approvers":"calantic-qa-deployers"
+      },
+      "^uat$": {
+        "cluster_name": "cng-api-gke",
+        "tag_name": "uat-customer",
+        "region": "us-west1",
+        "artifact_registry_region": "us",
+        "project_id": "",
+        "regional_project_id": "",
+        "approvers":"calantic-qa-deployers"
+      },
+      "^na$": {
+        "cluster_name": "cng-api-gke",
+        "tag_name": "na",
+        "region": "us-west1",
+        "artifact_registry_region": "us-west1",
+        "project_id": "",
+        "regional_project_id": "",
+        "approvers":"calantic-prod-deployers"
+      },
+      "^emea$": {
+        "cluster_name": "cng-api-gke",
+        "tag_name": "emea",
+        "region": "europe-west3",
+        "artifact_registry_region": "europe-west3",
+        "project_id": "",
+        "regional_project_id": "",
+        "approvers":"calantic-prod-deployers"
+      },
+      "^nhsggc$": {
+        "cluster_name": "cng-gke",
+        "tag_name": "nhsggc",
+        "region": "europe-west3",
+        "artifact_registry_region": "europe-west3",
+        "project_id": "",
+        "regional_project_id": "",
+        "approvers":"calantic-prod-deployers"
+      },
+      "^rush$": {
+        "cluster_name": "cng-gke",
+        "tag_name": "rush",
+        "region": "us-west1",
+        "artifact_registry_region": "us-west1",
+        "project_id": "",
+        "regional_project_id": "",
+        "approvers":"calantic-prod-deployers"
+      }
+
+    }
+  GCP_MAIN_PROJECT_ID: 
+
+jobs:
+  calculate_params:
+    name: '${{inputs.project_selection}} - Building parameter list'
+    runs-on: external-k8s-v2
+    timeout-minutes: 30
+    environment:
+      name: ${{inputs.project_selection}}
+    outputs:
+      cluster_name: ${{ steps.output1.outputs.cluster_name }}
+      region: ${{ steps.output1.outputs.region}}
+      artifact_registry_region: ${{ steps.output1.outputs.artifact_registry_region}}
+      project_id: ${{ steps.output1.outputs.project_id}}
+      regional_project_id: ${{ steps.output1.outputs.regional_project_id}}
+      hostname_registry: ${{ steps.output1.outputs.hostname_registry}}
+      tag_name: ${{ steps.output1.outputs.tag_name}}
+      docker_artifact_registry: ${{ env.docker_artifact_registry }}
+    steps:
+      - uses: actions/checkout@v3.5.0
+      - name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@3a3c4c57d294ef65efaaee4ff17b22fa88dd3c69'
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_KEY }}
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@e30db14379863a8c79331b04a9969f4c1e225e0b'
+      - name: Convert params to env
+        uses: kanga333/variable-mapper@3681b75f5c6c00162721168fb91ab74925eaebcb
+        with:
+          key: '${{inputs.project_selection}}'
+          map: '${{env.PARAM_MAP}}'
+      - name: set output for deployment
+        id: output1
+        run: |
+          echo "cluster_name=${{ env.cluster_name }}" >> "$GITHUB_OUTPUT"
+          echo "region=${{env.region}}" >> "$GITHUB_OUTPUT"
+          echo "artifact_registry_region=${{env.artifact_registry_region}}" >> "$GITHUB_OUTPUT"
+          echo "regional_project_id=${{ env.regional_project_id }}" >> "$GITHUB_OUTPUT"
+          echo "project_id=${{ env.project_id }}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${{ env.tag_name }}" >> "$GITHUB_OUTPUT"
+          echo "hostname_registry=${{env.artifact_registry_region}}-docker.pkg.dev" >> "$GITHUB_OUTPUT"
+      - id: 'secrets'
+        name: 'Load secrets'
+        uses: google-github-actions/get-secretmanager-secrets@ae0d4054c32840e2ced71207a9df55161ae3debc
+        with:
+          secrets: |-
+            GLOBAL_github_token:${{env.GCP_MAIN_PROJECT_ID}}/GLOBAL_github_token
+      - uses: trstringer/manual-approval@7c60b3aae340752ea5bb1a35e89b0796cd688eae
+        if: ${{env.approvers != '' }}
+        with:
+          secret: ${{ steps.secrets.outputs.GLOBAL_github_token }}
+          approvers: ${{env.approvers}}
+          minimum-approvals: 1
+          issue-title: 'Please review Deployment Plan '
+          issue-body: "Deploy Docker Image - ${{inputs.image_name}} to GCP project ${{inputs.project_selection}} - ${{ env.project_id }} \n Does the plan look good?(yes/no). \n "
+          exclude-workflow-initiator-as-approver: false
+          additional-approved-words: ''
+          additional-denied-words: ''
+
+  push_image_to_artifact_registry:
+    name: Push docker image to Artifact Registry
+    needs: calculate_params
+    uses: bayer-int/calantic-github-workflows/.github/workflows/docker-image-push-gcp.yml@main
+    secrets: inherit
+    with:
+      project_selection: ${{ inputs.project_selection}}
+      artifactory_repo: ${{ inputs.artifactory_repo}}.artifactory.bayer.com
+      image_name: ${{ inputs.image_name}}
+      image_tag: ${{ inputs.image_tag}}
+      docker_artifact_registry: ${{needs.calculate_params.outputs.docker_artifact_registry}}
+      hostname_registry: ${{needs.calculate_params.outputs.hostname_registry}}
+      regional_project_id: ${{needs.calculate_params.outputs.regional_project_id}}
+      tag_name: ${{needs.calculate_params.outputs.tag_name}}
+
+  deploy_gke_service:
+    name: Deploy to GKE - ${{inputs.project_selection}}
+    runs-on: external-k8s-v2
+    timeout-minutes: 30
+    needs: [calculate_params, push_image_to_artifact_registry]
+    env:
+      cluster_name: ${{needs.calculate_params.outputs.cluster_name}}
+      region: ${{needs.calculate_params.outputs.region}}
+      hostname_registry: ${{needs.calculate_params.outputs.hostname_registry}}
+      project_id: ${{needs.calculate_params.outputs.project_id}}
+    environment:
+      name: ${{inputs.project_selection}}
+    steps:
+      - name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@3a3c4c57d294ef65efaaee4ff17b22fa88dd3c69'
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_KEY }}
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@e30db14379863a8c79331b04a9969f4c1e225e0b'
+        with:
+          install_components: 'kubectl'
+      - name: Connect with GKE cluster
+        run: |
+          # gcloud container clusters update ${{env.cluster_name}} --region ${{env.region}}  --enable-master-authorized-networks  --master-authorized-networks $(curl ifconfig.me)/32 --project ${{env.project_id}}
+          gcloud container clusters get-credentials ${{env.cluster_name}} --region ${{env.region}}  --project ${{env.project_id}}
+          gcloud container clusters list
+          kubectl config set-context --current --namespace=${{inputs.gke_namespace}}
+          kubectl get deployments
+      - name: Trigger GKE Service Restart
+        id: restart_gke_service
+        run: |
+          kubectl rollout restart deployment/${{ inputs.image_name }} 
+          kubectl rollout status deployment/${{ inputs.image_name }}
+
+  update_manifest_on_success:
+    name: Update Secret Version Manifest on success - ${{inputs.project_selection}}
+    if: ${{ success() }}
+    needs: deploy_gke_service
+    uses: bayer-int/calantic-github-workflows/.github/workflows/update-release-manifest.yml@main
+    secrets: inherit
+    with:
+      env_name: ${{ inputs.project_selection}}
+      image_name: ${{ inputs.image_name }}
+      image_tag: ${{ inputs.image_tag }}
+
+  update_manifest_on_failure:
+    name: Update Secret Version Manifest on failure - ${{inputs.project_selection}}
+    if: ${{ failure() }}
+    needs: deploy_gke_service
+    uses: bayer-int/calantic-github-workflows/.github/workflows/update-release-manifest.yml@main
+    secrets: inherit
+    with:
+      env_name: ${{ inputs.project_selection}}
+      image_name: ${{ inputs.image_name }}
+      image_tag: 'error'
