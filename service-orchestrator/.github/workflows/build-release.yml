@@ -1,0 +1,27 @@
+name: Release Build Actions
+on:
+  workflow_dispatch:        
+  pull_request:
+    types:
+      - closed
+    branches:
+      - main
+    paths-ignore:
+      - .github/**
+      - .gitignore
+      - README.md
+      - docs/**
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  service_build:
+    if: ${{ github.event.pull_request.merged == true || ( github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main'|| startsWith(github.ref, 'refs/heads/hotfix'))) }}
+    name: Build Release Artifact
+    uses: bayer-int/calantic-github-workflows/.github/workflows/java-service-release.yml@main
+    secrets: inherit
+    with: 
+      is_service: true
+      runner_type: external-k8s-large-v2
