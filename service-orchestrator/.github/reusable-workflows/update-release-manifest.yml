@@ -1,0 +1,58 @@
+name: Update Release Version in Manifest
+on: 
+  workflow_call:
+    inputs:
+      env_name:
+        description: "Name of the environment to perform deployment"
+        type: string
+        required: true
+      image_name:
+        description: "Name of the Docker Image to deploy."
+        type: string
+        required: true
+      image_tag:
+        description: "Tag of the Docker Image to deploy."
+        type: string
+        required: true
+        
+env:
+  manifest_secret: deployment-manifest
+  GCP_MAIN_PROJECT_ID: qa-na
+
+jobs:
+  update_manifest:
+    name: Update Secret Version Manifest - ${{inputs.env_name}}
+    runs-on: external-k8s-v2
+    timeout-minutes: 30
+    environment:
+      name: ${{inputs.env_name}}
+    steps:
+      - name: "Authenticate to Google Cloud"
+        uses: "google-github-actions/auth@3a3c4c57d294ef65efaaee4ff17b22fa88dd3c69"
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_KEY }}
+      - name: "Set up Cloud SDK"
+        uses: "google-github-actions/setup-gcloud@e30db14379863a8c79331b04a9969f4c1e225e0b"
+      - name: Get Version Manifest
+        id: manifest
+        run: | 
+          manifest_json=$(gcloud secrets versions access latest --secret=${{inputs.env_name}}-${{env.manifest_secret}} --project ${{env.GCP_MAIN_PROJECT_ID}} )
+          echo $manifest_json > manifest.json
+          cat manifest.json
+      - name: Update Secret
+        run: |-
+          if [ -f "manifest.json" ]; then
+            updated_version=$(jq --arg image_name ${{ inputs.image_name }} --arg image_tag ${{ inputs.image_tag }} '.container_image[$image_name]=$image_tag | del(.["approved_by"]) | del(.["approved_timestamp"])' manifest.json )
+            echo $updated_version > updated_version.json
+            cat updated_version.json
+          else
+            echo "File manifest.json not found."
+          fi
+      - name: Add Updated secret
+        run: |
+          gcloud secrets versions add ${{inputs.env_name}}-${{env.manifest_secret}} --data-file=updated_version.json --project ${{env.GCP_MAIN_PROJECT_ID}}
+      - name: Add Alias 
+        run: |-
+          version_number=$(gcloud secrets versions list ${{inputs.env_name}}-${{env.manifest_secret}} --project ${{env.GCP_MAIN_PROJECT_ID}} --limit 1 | awk 'NR>1 {print $1}')
+          echo "$version_number"
+          gcloud secrets update ${{inputs.env_name}}-${{env.manifest_secret}} --update-version-aliases=${{inputs.env_name}}=$version_number --project ${{env.GCP_MAIN_PROJECT_ID}}
