@@ -1,0 +1,387 @@
+name: Production Deployment Action
+on:
+  workflow_dispatch:
+    inputs:
+      env_name:
+        description: 'Name of the environment to perform production deployment'
+        type: environment
+        required: true
+      approved_manifest_version:
+        description: 'Provide the approved manifest version to deploy'
+        type: string
+        default: latest
+        required: true
+
+env:
+  GCP_MAIN_PROJECT_ENV: na-qa 
+  docker_artifact_registry: calantic-internal
+  manifest_secret: deployment-manifest
+  approved_manifest: approved-release-manifest
+  artifactory_user: calantic-dev
+  GCP_MAIN_PROJECT_ID: pbeat04006578-qa-f92a-calantic
+
+jobs:
+  manual_review:
+    name: Manual Review - ${{inputs.env_name}}
+    runs-on: external-k8s-v2
+    timeout-minutes: 30
+    environment:
+      name: team-deployment-reviewer
+    steps:
+      - name: Review the deployment
+        run: echo "Deployment Approved"
+
+  # Copy approved-deployment-manifest from QA project to the project in which we want to perform the deployment
+  copy_manifest:
+    name: Copy Approved manifest to - ${{inputs.env_name}}
+    runs-on: external-k8s-v2
+    needs: manual_review
+    timeout-minutes: 30
+    environment:
+      name: ${{inputs.env_name}}
+    steps:
+      - name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@3a3c4c57d294ef65efaaee4ff17b22fa88dd3c69'
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_KEY }}
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@e30db14379863a8c79331b04a9969f4c1e225e0b'
+      - name: Get Version Manifest
+        id: manifest
+        run: |
+          gcloud config set project ${{env.GCP_MAIN_PROJECT_ID}}
+          manifest_json=$(gcloud secrets versions access ${{inputs.approved_manifest_version}} --secret=${{env.approved_manifest}} --project ${{env.GCP_MAIN_PROJECT_ID}})
+          echo $manifest_json > manifest.json
+          cat manifest.json
+      
+      - name: Copy manifest to ${{inputs.env_name}}
+        run: |
+          gcloud config set project ${{vars.PROJECT_ID}}
+          gcloud secrets versions add ${{inputs.env_name}}-${{env.manifest_secret}} --data-file=manifest.json --project ${{vars.PROJECT_ID}}
+      - name: Add Alias
+        run: |-
+          version_number=$(gcloud secrets versions list ${{inputs.env_name}}-${{env.manifest_secret}} --limit 1 --project=${{ vars.PROJECT_ID }} | awk 'NR>1 {print $1}')
+          echo "$version_number"
+          gcloud secrets update ${{inputs.env_name}}-${{env.manifest_secret}} --update-version-aliases=${{inputs.env_name}}=$version_number --project ${{vars.PROJECT_ID}}
+      - name: Copy manifest to ${{env.GCP_MAIN_PROJECT_ENV}}
+        run: |
+          gcloud config set project ${{env.GCP_MAIN_PROJECT_ID}}
+          gcloud secrets versions add ${{inputs.env_name}}-${{env.manifest_secret}} --data-file=manifest.json --project ${{env.GCP_MAIN_PROJECT_ID}}
+      - name: Add Alias to ${{env.GCP_MAIN_PROJECT_ENV}}
+        run: |-
+          version_number=$(gcloud secrets versions list ${{inputs.env_name}}-${{env.manifest_secret}} --limit 1 --project=${{env.GCP_MAIN_PROJECT_ID}} | awk 'NR>1 {print $1}')
+          echo "$version_number"
+          gcloud secrets update ${{inputs.env_name}}-${{env.manifest_secret}} --update-version-aliases=${{inputs.env_name}}=$version_number --project ${{env.GCP_MAIN_PROJECT_ID}}
+
+  # Get GCP Config secret from secret manager for deployment of docker images
+  get_gcp_config:
+    name: Get GCP configuration
+    needs: copy_manifest
+    runs-on: external-k8s-v2
+    environment:
+      name: ${{inputs.env_name}}
+    steps:
+      - name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@3a3c4c57d294ef65efaaee4ff17b22fa88dd3c69'
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_KEY }}
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@e30db14379863a8c79331b04a9969f4c1e225e0b'
+      - name: Get GCP Config
+        run: |
+          gcp_config_json=$(gcloud secrets versions access latest --secret=${{inputs.env_name}}-gcp-config --project=${{ vars.PROJECT_ID }})
+          echo $gcp_config_json > gcp_config.json
+          cat gcp_config.json
+      - name: Upload as Artifacts
+        if: success()
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        with:
+          name: config
+          path: |-
+            gcp_config.json
+
+  ## List container images to deploy from the GCP Config
+  list_container_images:
+    name: List Container Images
+    runs-on: external-k8s-v2
+    needs: get_gcp_config
+    environment:
+      name: ${{inputs.env_name}}
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          name: config
+          path: .
+      - name: Get image list
+        id: vars
+        run: |-
+          if [ -f "gcp_config.json" ]; then
+            hostname_registry=($(jq -r '."hostname_registry" ' gcp_config.json))
+            echo $hostname_registry
+            regional_project_id=($(jq -r '."regional_project_id" ' gcp_config.json))
+            echo $regional_project_id
+            cluster_name=($(jq -r '."gke_cluster" | keys[0] ' gcp_config.json))
+            echo $cluster_name
+
+            image_names=($(jq -r --arg cluster_name $cluster_name '.gke_cluster[$cluster_name].container_image | .[].image_name  ' gcp_config.json))
+            image_names_json=$(echo "${image_names[@]}" | tr -d '\n' | jq -R -s -c 'split(" ")')
+            echo "Image Names: $image_names_json"
+            echo "image_matrix={\"image_name\":$image_names_json}" >> $GITHUB_OUTPUT
+
+            deployment_names=($(jq -r --arg cluster_name $cluster_name '.gke_cluster[$cluster_name].container_image | .[].deployment_name  ' gcp_config.json))
+            deployment_names_json=$(echo "${deployment_names[@]}" | tr -d '\n' | jq -R -s -c 'split(" ")')
+            echo "Deployment Names: $deployment_names_json"
+            echo "deployment_matrix={\"deployment_name\":$deployment_names_json}" >> $GITHUB_OUTPUT
+
+            region=$(jq -r --arg cluster_name $cluster_name '.gke_cluster[$cluster_name].region' gcp_config.json)
+            echo "cluster_name=$cluster_name" >> $GITHUB_OUTPUT
+            echo "region=$region"  >> $GITHUB_OUTPUT
+            echo "hostname_registry=$hostname_registry"  >> $GITHUB_OUTPUT
+            echo "regional_project_id=$regional_project_id"  >> $GITHUB_OUTPUT
+          else
+            echo "File gcp_config.json not found."
+          fi
+    outputs:
+      image_matrix: ${{ steps.vars.outputs.image_matrix}}
+      deployment_matrix: ${{ steps.vars.outputs.deployment_matrix}}
+      region: ${{ steps.vars.outputs.region}}
+      cluster_name: ${{ steps.vars.outputs.cluster_name}}
+      hostname_registry: ${{ steps.vars.outputs.hostname_registry}}
+      regional_project_id: ${{ steps.vars.outputs.regional_project_id}}
+
+  push_image_to_artifact_registry:
+    name: Push docker image to Artifact Registry
+    runs-on: external-k8s-v2
+    timeout-minutes: 30
+    needs: list_container_images
+    environment:
+      name: ${{inputs.env_name}}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.list_container_images.outputs.image_matrix) }}
+    env:
+      hostname_registry: ${{needs.list_container_images.outputs.hostname_registry}}
+      regional_project_id: ${{needs.list_container_images.outputs.regional_project_id}}
+      artifactory_repo: calantic-docker-release-local.artifactory.bayer.com
+    steps:
+      - name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@3a3c4c57d294ef65efaaee4ff17b22fa88dd3c69'
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_KEY }}
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@e30db14379863a8c79331b04a9969f4c1e225e0b'
+      - id: 'secrets'
+        name: 'Load secrets'
+        uses: 'google-github-actions/get-secretmanager-secrets@4d6d3dfd94110800dda8d84109cb6da0f6a5919d'
+        with:
+          secrets: |-
+            artifactory_password:${{env.GCP_MAIN_PROJECT_ID}}/GLOBAL_artifactory_pass
+      - name: Get Version Manifest
+        run: |
+          manifest_json=$(gcloud secrets versions access ${{inputs.env_name}} --secret=${{inputs.env_name}}-${{env.manifest_secret}} --project ${{vars.PROJECT_ID}})
+          echo $manifest_json > manifest.json
+          cat manifest.json
+      - name: Get Image Tag
+        id: manifest
+        run: |-
+          if [ -f "manifest.json" ]; then
+            image_tag=$(jq -r --arg image_name ${{ matrix.image_name }} '.container_image[$image_name]' "manifest.json")
+            echo "image_tag=$image_tag" >> $GITHUB_OUTPUT;
+          else
+            echo "File manifest.json not found."
+          fi
+      - name: Authenticate with JFrog Artifactory
+        run: docker login -u ${{env.artifactory_user}} -p ${{ steps.secrets.outputs.artifactory_password }} ${{env.artifactory_repo}}
+      - name: Pull docker image
+        run: |-
+          docker pull ${{env.artifactory_repo}}/${{ matrix.image_name }}:${{steps.manifest.outputs.image_tag}}
+      - name: Authenticate with Google Artifact registry
+        run: |
+          gcloud auth configure-docker ${{env.hostname_registry}} --project ${{ env.regional_project_id }}
+      - name: Tag and Push Docker Image
+        run: |
+          docker_image_name=${{env.hostname_registry}}/${{ env.regional_project_id }}/${{env.docker_artifact_registry}}/${{ matrix.image_name }}
+          docker tag ${{env.artifactory_repo}}/${{ matrix.image_name }}:${{steps.manifest.outputs.image_tag}} ${docker_image_name}:${{steps.manifest.outputs.image_tag}}
+          docker tag ${{env.artifactory_repo}}/${{ matrix.image_name }}:${{steps.manifest.outputs.image_tag}} ${docker_image_name}:latest
+          docker tag ${{env.artifactory_repo}}/${{ matrix.image_name }}:${{steps.manifest.outputs.image_tag}} ${docker_image_name}:${{ inputs.env_name }}
+          docker image ls
+          docker push ${docker_image_name} --all-tags
+
+  # Deploy the docker images to GKE
+  deploy_gke_service:
+    name: Deploy to GKE
+    needs: [push_image_to_artifact_registry, list_container_images]
+    runs-on: external-k8s-v2
+    environment:
+      name: ${{inputs.env_name}}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.list_container_images.outputs.deployment_matrix) }}
+    env:
+      cluster_name: ${{needs.list_container_images.outputs.cluster_name}}
+      region: ${{needs.list_container_images.outputs.region}}
+      hostname_registry: ${{needs.list_container_images.outputs.hostname_registry}}
+      regional_project_id: ${{needs.list_container_images.outputs.regional_project_id}}
+    steps:
+      - name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@3a3c4c57d294ef65efaaee4ff17b22fa88dd3c69'
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_KEY }}
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@e30db14379863a8c79331b04a9969f4c1e225e0b'
+        with:
+          install_components: 'kubectl'
+      - name: Print image name
+        run: |
+          echo ${{ matrix.deployment_name }}
+      - name: Get Version Manifest
+        run: |
+          manifest_json=$(gcloud secrets versions access ${{inputs.env_name}} --secret=${{inputs.env_name}}-${{env.manifest_secret}} --project ${{vars.project_id}})
+          echo $manifest_json > manifest.json
+          cat manifest.json
+      - name: Get Image Tag
+        id: manifest
+        run: |-
+          if [ -f "manifest.json" ]; then
+            image_tag=$(jq -r --arg image_name ${{ matrix.deployment_name }} '.container_image[$image_name]' "manifest.json")
+            echo "image_tag=$image_tag" >> $GITHUB_OUTPUT;
+          else
+            echo "File manifest.json not found."
+          fi
+      - name: Get GCP config
+        run: |
+          gcp_config_json=$(gcloud secrets versions access latest --secret=${{inputs.env_name}}-gcp-config --project ${{vars.project_id}})
+          echo $gcp_config_json > gcp_config.json
+          cat gcp_config.json
+      - name: Get Deployment Variables
+        id: deploy-vars
+        run: |-
+          if [ -f "gcp_config.json" ]; then
+            image_data=$(jq -r -c --arg cluster_name ${{env.cluster_name}} --arg image_name "${{matrix.deployment_name}}" '.gke_cluster[$cluster_name].container_image |.[] | select(.deployment_name == $image_name)' gcp_config.json )
+            echo $image_data
+
+            if [ -z "$image_data" ];  then
+              echo "Image: ${{ matrix.deployment_name }} , details not found in the gcp_config json. To deploy docker Image to GKE add the details in GCP secret manifest";
+            else
+              deployment_name=$(jq -r '.deployment_name' <<< "$image_data")
+              container_name=$(jq -r '.container_name'<<< "$image_data" )
+              namespace=$(jq -r '.namespace'<<< "$image_data" )
+              project_id="${{ vars.PROJECT_ID }}";
+
+              echo "project_id=$project_id" >> $GITHUB_OUTPUT;
+              echo "deployment_name=$deployment_name" >> $GITHUB_OUTPUT;
+              echo "container_name=$container_name" >> $GITHUB_OUTPUT;
+              echo "namespace=$namespace" >> $GITHUB_OUTPUT;
+            fi
+          else
+            echo "File manifest.json not found."
+          fi
+
+      - name: Connect with GKE cluster
+        run: |
+          gcloud container clusters get-credentials ${{env.cluster_name}} --region ${{env.region}}  --project ${{vars.project_id}}
+          gcloud container clusters list
+          kubectl config set-context --current --namespace=${{steps.deploy-vars.outputs.namespace}}
+          kubectl get deployments
+
+      - name: Deploy Artifact
+        id: deploy
+        run: |
+          kubectl rollout restart deployment/${{ matrix.deployment_name }}
+          kubectl rollout status deployment/${{ matrix.deployment_name }}
+
+  extract_frontend_versions:
+    runs-on: external-k8s-v2
+    needs: list_container_images
+    environment:
+      name: ${{inputs.env_name}}
+    env:
+      regional_project_id: ${{needs.list_container_images.outputs.regional_project_id}}
+      FRONTEND_REPOS_CSV: 'calantic-frontend-dashboard calantic-frontend-user-management calantic-frontend-locales-cng-footer'
+    steps:
+      - name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@3a3c4c57d294ef65efaaee4ff17b22fa88dd3c69'
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_KEY }}
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@e30db14379863a8c79331b04a9969f4c1e225e0b'
+
+      - name: Get Version Manifest
+        run: |
+          manifest_json=$(gcloud secrets versions access ${{inputs.env_name}} --secret=${{inputs.env_name}}-${{env.manifest_secret}} --project ${{vars.PROJECT_ID}})
+          echo $manifest_json > manifest.json
+          cat manifest.json
+
+      - name: Extract Frontend Version
+        id: extract
+        run: |
+          FRONTEND_CONFIG_JSON='{"frontend_key": []}'
+          if [ -f "manifest.json" ]; then
+
+            FRONTEND_REPOS=$(echo "${{ env.FRONTEND_REPOS_CSV }}" | sed "s/,/ /g")
+            for REPO in $FRONTEND_REPOS
+            do
+              frontend_version=$(jq --arg REPO "$REPO" -rc '.container_image[$REPO]' "manifest.json")
+              echo "$REPO=$frontend_version" >> $GITHUB_OUTPUT
+            done
+          else
+            echo "File manifest.json not found."
+          fi
+    outputs:
+      calantic-frontend-dashboard: ${{ steps.extract.outputs.calantic-frontend-dashboard }}
+      calantic-frontend-user-management: ${{ steps.extract.outputs.calantic-frontend-user-management }}
+      calantic-frontend-locales-cng-footer: ${{ steps.extract.outputs.calantic-frontend-locales-cng-footer }}
+
+  # Deploy the zip files to GCS
+  deploy_non_container_service:
+    needs: extract_frontend_versions
+    if: |
+      needs.extract_frontend_versions.outputs.calantic-frontend-dashboard != 'null' ||
+      needs.extract_frontend_versions.outputs.calantic-frontend-user-management != 'null'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        frontend_key:
+          - artifact: calantic-frontend-dashboard
+            bucket: ${{inputs.env_name}}-dashboard-frontend
+            version: ${{ needs.extract_frontend_versions.outputs.calantic-frontend-dashboard }}
+          - artifact: calantic-frontend-user-management
+            bucket: ${{inputs.env_name}}-user-management-frontend
+            version: ${{ needs.extract_frontend_versions.outputs.calantic-frontend-user-management }}
+
+    name: Deploy Non-Container Artifact
+    secrets: inherit
+    uses: bayer-int/calantic-github-workflows/.github/workflows/deploy-gcs-actions.yml@feature/non-container-deploy
+    with:
+      build_name: ${{ matrix.frontend_key.artifact }}
+      build_number: ${{ matrix.frontend_key.version }}
+      env_name: ${{inputs.env_name}}
+      bucket_name: ${{ matrix.frontend_key.bucket }}
+      artifactory_repo: calantic-generic-release-artifact
+      skip_manual_approval: true
+
+  deploy_locales_bucket:
+    name: Deploy Footer Artifact
+    if: ${{ needs.extract_frontend_versions.outputs.calantic-frontend-locales-cng-footer != 'null' }}
+    needs: extract_frontend_versions
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        frontend_key:
+          - artifact: calantic-frontend-locales-cng
+            bucket: ${{inputs.env_name}}-locales-frontend
+            version: ${{ needs.extract_frontend_versions.outputs.calantic-frontend-locales-cng-footer }}
+    uses: bayer-int/calantic-github-workflows/.github/workflows/deploy-files-gcs-actions.yml@feature/non-container-deploy
+    secrets: inherit
+    with:
+      project_selection: ${{inputs.env_name}}
+      build_name: ${{ matrix.frontend_key.artifact }}
+      bucket_name: ${{ matrix.frontend_key.bucket }}
+      path_to_copy: footer
+      build_number: ${{ matrix.frontend_key.version }}
+      artifactory_repo: calantic-generic-release-artifact
