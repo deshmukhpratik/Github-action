@@ -1,0 +1,220 @@
+name: Docker Image Push to GCP
+on:
+  workflow_call:
+    inputs:
+      project_selection:
+        description: 'Name of the environment to perform deployment'
+        type: string
+        required: true
+      artifactory_repo:
+        description: 'Name of the Bayer Artifact Registry'
+        required: true
+        type: string
+      image_name:
+        description: 'Provide the clinical application docker image name to deploy'
+        required: true
+        type: string
+      image_tag:
+        description: 'Provide the clinical application docker image tag to deploy'
+        type: string
+        default: latest
+      docker_artifact_registry:
+        description: 'Docker registry to push docker images to'
+        type: string
+        required: true
+      hostname_registry:
+        description: 'Hostname Registry to push docker images to'
+        type: string
+        required: false
+      regional_project_id:
+        description: 'Regional Project ID to push docker images to'
+        type: string
+        required: false
+      tag_name:
+        description: 'Add tag to the docker image'
+        type: string
+        required: false
+
+env:
+  artifactory_user: calantic-dev
+  PARAM_MAP: |
+    {
+     "^dev2$": {
+        "cluster_name": "cng-gke",
+        "tag_name": "dev2-customer",
+        "region": "us-west1",
+        "artifact_registry_region": "us",
+        "project_id": "",
+        "regional_project_id": ""
+      },
+      "^dev-na$": {
+        "cluster_name": "cng-api-gke",
+        "tag_name": "dev-na",
+        "region": "us-west1",
+        "artifact_registry_region": "us",
+        "project_id": "",
+        "regional_project_id": ""
+      },
+      "^qa$": {
+        "cluster_name": "cng-gke",
+        "tag_name": "qa-customer",
+        "region": "us-west1",
+        "artifact_registry_region": "us",
+        "project_id": "",
+        "regional_project_id": ""
+      },
+      "^qa-na$": {
+        "cluster_name": "cng-api-gke",
+        "tag_name": "qa-na",
+        "region": "us-west1",
+        "artifact_registry_region": "us",
+        "project_id": "",
+        "regional_project_id": ""
+      },
+      "^idev-na$": {
+        "cluster_name": "cng-api-gke",
+        "tag_name": "idev-na",
+        "region": "us-west1",
+        "artifact_registry_region": "us",
+        "project_id": "",
+        "regional_project_id": ""
+      },
+      "^uat-na$": {
+        "cluster_name": "cng-api-gke",
+        "tag_name": "uat-na",
+        "region": "us-west1",
+        "artifact_registry_region": "us",
+        "project_id": "",
+        "regional_project_id": ""
+      },
+      "^na$": {
+        "cluster_name": "cng-api-gke",
+        "tag_name": "na",
+        "region": "us-west1",
+        "artifact_registry_region": "us-west1",
+        "project_id": "",
+        "regional_project_id": ""
+      },
+      "^emea$": {
+        "cluster_name": "cng-api-gke",
+        "tag_name": "emea",
+        "region": "europe-west3",
+        "artifact_registry_region": "europe-west3",
+        "project_id": "",
+        "regional_project_id": ""
+      },
+      "^rush$": {
+        "cluster_name": "cng-gke",
+        "tag_name": "rush",
+        "region": "us-west1",
+        "artifact_registry_region": "us-west1",
+        "project_id": "",
+        "regional_project_id": ""
+      },
+      "^prod-na$": {
+        "cluster_name": "cng-api-gke",
+        "tag_name": "na",
+        "region": "us-west1",
+        "artifact_registry_region": "us-west1",
+        "project_id": "",
+        "regional_project_id": ""
+      },
+      "^nhsggc$": {
+        "cluster_name": "cng-gke",
+        "tag_name": "nhsggc",
+        "region": "europe-west3",
+        "artifact_registry_region": "europe-west3",
+        "project_id": "",
+        "regional_project_id": ""
+      }
+    }
+  GCP_MAIN_PROJECT_ID: 
+
+jobs:
+  calculate_params:
+    name: 'Workflow parameter list: ${{inputs.project_selection}}'
+    runs-on: external-k8s-v2
+    timeout-minutes: 30
+    environment:
+      name: ${{inputs.project_selection}}
+    if: ${{ ! inputs.hostname_registry && ! inputs.regional_project_id && ! inputs.tag_name }}
+    outputs:
+      region: ${{ steps.params.outputs.region}}
+      artifact_registry_region: ${{ steps.params.outputs.artifact_registry_region}}
+      regional_project_id: ${{ steps.params.outputs.regional_project_id}}
+      hostname_registry: ${{ steps.params.outputs.hostname_registry}}
+      tag_name: ${{ steps.params.outputs.tag_name}}
+
+    steps:
+      - uses: actions/checkout@v3.5.0
+      - name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@3a3c4c57d294ef65efaaee4ff17b22fa88dd3c69'
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_KEY }}
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@e30db14379863a8c79331b04a9969f4c1e225e0b'
+      - name: Convert params to env
+        uses: kanga333/variable-mapper@3681b75f5c6c00162721168fb91ab74925eaebcb
+        with:
+          key: '${{inputs.project_selection}}'
+          map: '${{env.PARAM_MAP}}'
+      - name: set output for deployment
+        id: params
+        run: |
+          echo "region=${{env.region}}" >> "$GITHUB_OUTPUT"
+          echo "artifact_registry_region=${{env.artifact_registry_region}}" >> "$GITHUB_OUTPUT"
+          echo "regional_project_id=${{ env.regional_project_id }}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${{ env.tag_name }}" >> "$GITHUB_OUTPUT"
+          echo "hostname_registry=${{env.artifact_registry_region}}-docker.pkg.dev" >> "$GITHUB_OUTPUT"
+
+  push_image_to_artifact_registry:
+    name: Push docker image to Artifact Registry
+    runs-on: external-k8s-v2
+    needs: calculate_params
+    if: always()
+    timeout-minutes: 30
+    environment:
+      name: ${{inputs.project_selection}}
+    steps:
+      - name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@3a3c4c57d294ef65efaaee4ff17b22fa88dd3c69'
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_KEY }}
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@e30db14379863a8c79331b04a9969f4c1e225e0b'
+      - id: 'secrets'
+        name: 'Load secrets'
+        uses: 'google-github-actions/get-secretmanager-secrets@4d6d3dfd94110800dda8d84109cb6da0f6a5919d'
+        with:
+          secrets: |-
+            artifactory_password:${{env.GCP_MAIN_PROJECT_ID}}/GLOBAL_artifactory_pass
+      - id: config
+        name: Set Variables
+        run: |
+          if [ -n "${{ inputs.hostname_registry}}" ] && [ -n "${{ inputs.regional_project_id}}" ] && [ -n "${{ inputs.tag_name}}" ]; then
+            echo "hostname_registry=${{inputs.hostname_registry}}" >> "$GITHUB_OUTPUT"
+            echo "regional_project_id=${{inputs.regional_project_id}}" >> "$GITHUB_OUTPUT"
+            echo "tag_name=${{inputs.tag_name}}" >> "$GITHUB_OUTPUT"
+            echo "Running for workflow_call"
+          else
+            echo "hostname_registry=${{needs.calculate_params.outputs.hostname_registry}}" >> "$GITHUB_OUTPUT"
+            echo "regional_project_id=${{needs.calculate_params.outputs.regional_project_id}}" >> "$GITHUB_OUTPUT"
+            echo "tag_name=${{needs.calculate_params.outputs.tag_name}}" >> "$GITHUB_OUTPUT"
+            echo "Running for workflow_dispatch"
+          fi
+      - name: Authenticate with JFrog Artifactory
+        run: docker login -u ${{env.artifactory_user}} -p ${{ steps.secrets.outputs.artifactory_password }} ${{inputs.artifactory_repo}}
+      - name: Pull docker image
+        run: |-
+          docker pull ${{inputs.artifactory_repo}}/${{ inputs.image_name }}:${{ inputs.image_tag }}
+      - name: Authenticate with Google Artifact registry
+        run: |
+          gcloud auth configure-docker ${{ steps.config.outputs.hostname_registry }} --project ${{ steps.config.outputs.regional_project_id}}
+      - name: Tag and Push Docker Image
+        run: |
+          docker_image_name=${{ steps.config.outputs.hostname_registry }}/${{ steps.config.outputs.regional_project_id}}/${{inputs.docker_artifact_registry}}/${{ inputs.image_name }}
+          docker tag ${{inputs.artifactory_repo}}/${{ inputs.image_name }}:${{ inputs.image_tag }} ${docker_image_name}:${{ inputs.image_tag }}
+          docker tag ${{inputs.artifactory_repo}}/${{ inputs.image_name }}:${{ inputs.image_tag }} ${docker_image_name}:latest
+          docker tag ${{inputs.artifactory_repo}}/${{ inputs.image_name }}:${{ inputs.image_tag }} ${docker_image_name}:${{ steps.config.outputs.tag_name }}
+          docker image ls
+          docker push ${docker_image_name} --all-tags
