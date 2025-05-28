@@ -1,0 +1,41 @@
+name: Service Deploy Actions
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Tag of the Docker Image to deploy."
+        type: string
+        required: true
+      artifactory_repo:
+        description: "Bayer Artifact Repository to pull Docker Image."
+        type: choice
+        required: false
+        options:
+            - calantic-docker-dev-local
+            - calantic-docker-release-local
+      project_selection:
+        description: "Name of the environment to perform deployment (matches json shorthand in deployscript)."
+        type: choice
+        required: true
+        options:
+          - dev2
+          - qa
+          - idev
+          - uat
+          - prod
+
+concurrency:
+  group: "${{ github.workflow }}-${{ inputs.project_selection }}"
+  cancel-in-progress: false
+
+jobs:
+  deploy_docker_image:
+    name: Deploy Docker Image
+    uses: deshmukhpratik/Github-action/service-orchestrator/.github/reusable-workflows/deploy-gcp-action.yml@main
+    secrets: inherit
+    with:
+      image_name: orchestrator-service
+      image_tag: ${{inputs.image_tag}}
+      artifactory_repo: ${{inputs.artifactory_repo}}
+      project_selection: ${{inputs.project_selection}}
+      gke_namespace: default
