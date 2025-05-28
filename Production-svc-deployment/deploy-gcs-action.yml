@@ -1,0 +1,187 @@
+name: Frontend GCS Deploy Action
+on:
+  workflow_call:
+    inputs:
+      env_name:
+        description: 'Environment name to perform the deployment'
+        type: string
+        required: true
+        # options:
+        #   - dev-na
+        #   - qa-na
+        #   - idev-na
+        #   - uat-na
+        #   - prod-na
+      build_name:
+        description: 'Name of the build image'
+        type: string
+        required: true
+      bucket_name:
+        description: 'Name of the bucket backend'
+        type: string
+        required: true
+      build_number:
+        description: 'Build Number of artifact to pull'
+        type: string
+        required: true
+      artifactory_repo:
+        description: 'Jfrog artifactory to pull image'
+        type: string
+        required: true
+      skip_manual_approval:
+        description: Check if manual approval to be triggered
+        type: boolean
+        default: false
+
+env:
+  ARTIFACTORY_USER: calantic-dev
+  ARTIFACTORY_URL: https://artifactory.bayer.com/artifactory
+  GCP_MAIN_PROJECT_ID: qa-na
+  PARAM_MAP: |
+    {
+      "^dev-na$": {
+        "region": "us-west1",
+        "project_id": ""
+      },
+
+      "^qa-na$": {
+        "region": "us-west1",
+        "project_id": "",
+        "approvers":"calantic-qa-deployers"
+      },
+      "^idev-na$": {
+        "region": "us-west1",
+        "project_id": ""
+      },
+      "^uat-na$": {
+        "region": "us-west1",
+        "project_id": "",
+        "approvers":"calantic-qa-deployers"
+      },
+      "^prod-na$": {
+        "region": "us-west1",
+        "project_id": "",
+        "approvers":"calantic-prod-deployers"
+      },
+      "^emea$": {
+        "region": "europe-west3",
+        "project_id": "",
+        "approvers":"calantic-prod-deployers"
+      }
+
+    }
+
+jobs:
+  deploy_to_gcs:
+    name: '${{inputs.env_name}} - Deploy Artifact'
+    runs-on: external-k8s-v2
+    timeout-minutes: 30
+    environment:
+      name: ${{ inputs.env_name }}
+    env:
+      VERSION_NUMBER: ${{ inputs.build_number }}
+      BUILD_NAME: ${{ inputs.build_name }}
+      BUCKET_NAME: ${{ inputs.bucket_name }}
+    steps:
+      - uses: actions/checkout@v3
+      - uses: jfrog/setup-jfrog-cli@0f30b43d62ccad81fba40748d2c671c4665b2d27
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@3a3c4c57d294ef65efaaee4ff17b22fa88dd3c69
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_KEY }}
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@e30db14379863a8c79331b04a9969f4c1e225e0b'
+
+      - id: 'secrets'
+        name: 'Load secrets'
+        uses: 'google-github-actions/get-secretmanager-secrets@4d6d3dfd94110800dda8d84109cb6da0f6a5919d'
+        with:
+          secrets: |-
+            artifactory_password:${{env.GCP_MAIN_PROJECT_ID}}/GLOBAL_artifactory_pass
+            GLOBAL_github_token:${{env.GCP_MAIN_PROJECT_ID}}/GLOBAL_github_token
+
+      - id: params
+        name: Convert params to env
+        uses: kanga333/variable-mapper@3681b75f5c6c00162721168fb91ab74925eaebcb
+        with:
+          key: '${{inputs.env_name}}'
+          map: '${{env.PARAM_MAP}}'
+
+      - name: manual approval
+        if: ${{ inputs.skip_manual_approval == false && env.approvers != ''  }}
+        uses: trstringer/manual-approval@7c60b3aae340752ea5bb1a35e89b0796cd688eae
+        with:
+          secret: ${{steps.secrets.outputs.GLOBAL_github_token}}
+          approvers: ${{env.approvers}}
+          minimum-approvals: 1
+          issue-title: 'Please review Deployment Plan '
+          issue-body: "Deploy Frontend image ${{inputs.build_name}} to GCP project ${{env.project_id}} - bucket ${{inputs.bucket_name}} \n Does the plan look good?(yes/no). \n "
+          exclude-workflow-initiator-as-approver: false
+          additional-approved-words: ''
+          additional-denied-words: ''
+
+      - name: Download Artifact Version
+        run: |
+          if [ -z "$VERSION_NUMBER" ]; then
+            echo "No VERSION_NUMBER provided, downloading latest"
+            PATH_TO_LATEST=$(jfrog rt search ${{inputs.artifactory_repo}}/${BUILD_NAME}/ --sort-by=created --sort-order=desc --limit=1 --url ${ARTIFACTORY_URL} --user ${ARTIFACTORY_USER} --password ${{ steps.secrets.outputs.artifactory_password }} | jq -r '.[0].path')
+            jf rt download ${PATH_TO_LATEST} --url ${ARTIFACTORY_URL} --user ${ARTIFACTORY_USER} --password ${{ steps.secrets.outputs.artifactory_password }} --flat
+          else
+            jf rt download ${{inputs.artifactory_repo}}/${BUILD_NAME}/${VERSION_NUMBER}/${BUILD_NAME}-${VERSION_NUMBER}.zip --url ${ARTIFACTORY_URL} --user ${ARTIFACTORY_USER} --password ${{ steps.secrets.outputs.artifactory_password }} --flat
+          fi
+      - name: Check downloaded files
+        run: |
+          pwd
+          ls -l
+      - name: Unzip Artifact
+        run: unzip ${BUILD_NAME}-${VERSION_NUMBER}.zip -d .
+      - name: Delete previous version
+        run: gsutil -m rm -r gs://${BUCKET_NAME}/assets/** || exit 0
+      - name: Upload build to bucket
+        run: gsutil -m -h "Cache-Control:no-cache" cp -r dist/* gs://${BUCKET_NAME}
+      - name: Update version
+        run: |
+
+          # Run specific steps if being triggered from Production Release Action
+          if [[ "${{ inputs.skip_manual_approval }}" == "true" ]]
+          then
+            echo "env.js file does not exist, preparing a new file..."
+
+            # Clone the service repository
+            git clone https://${{steps.secrets.outputs.GLOBAL_github_token}}@github.com/bayer-int/${{ inputs.build_name }}.git
+
+            # Copy the deployment configs folder
+            cp -r "${{ inputs.build_name }}/deployment-configs" .
+
+            # Remove other repository files
+            rm -rf ${{ inputs.build_name }}
+
+            # Validation step
+            ls -l
+            cat deployment-configs/${{ inputs.env_name }}/env.js
+          fi
+          sed -i "s+version_info+$VERSION_NUMBER+g" deployment-configs/${{ inputs.env_name }}/env.js
+      - name: Upload regional configs to bucket
+        run: gsutil -m -h "Cache-Control:no-cache" cp -r deployment-configs/${{ inputs.env_name }}/env.js gs://${BUCKET_NAME}
+
+  update_manifest_on_success:
+    name: Update Secret Version Manifest on success - ${{inputs.env_name}}
+    if: ${{ success() }}
+    needs: deploy_to_gcs
+    uses: bayer-int/calantic-github-workflows/.github/workflows/update-release-manifest.yml@main
+    secrets: inherit
+    with:
+      env_name: ${{ inputs.env_name}}
+      image_name: ${{ inputs.build_name }}
+      image_tag: ${{ inputs.build_number }}
+
+  update_manifest_on_failure:
+    name: Update Secret Version Manifest on failure - ${{inputs.env_name}}
+    if: ${{ failure() }}
+    needs: deploy_to_gcs
+    uses: bayer-int/calantic-github-workflows/.github/workflows/update-release-manifest.yml@main
+    secrets: inherit
+    with:
+      env_name: ${{ inputs.env_name}}
+      image_name: ${{ inputs.build_name }}
+      image_tag: 'error'
