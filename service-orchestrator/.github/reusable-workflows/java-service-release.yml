@@ -1,0 +1,341 @@
+name: Java Service Release Candidate Build Actions
+on:
+  workflow_call:
+    inputs:
+      is_service:
+        description: "Is this a service? (services produce a docker artifact and libraries don't)"
+        type: boolean
+        required: false
+      docker_image:
+        description: "Name of the dependent Docker Image to perform the release"
+        type: string
+        required: false
+      custom_script_path:
+        description: Path of the custom script
+        type: string
+        required: false
+      runner_type:
+        description: "Runner to use"
+        type: string
+        required: false
+        default: external-k8s-v2
+      
+env:
+  RUN_TAG: ${{github.run_number}}-${{github.run_attempt}}
+  ARTIFACTORY_USER: calantic-dev
+  ARTIFACTORY_REPO: calantic-docker-release-local.artifactory.bayer.com
+  SONAR_HOST_URL: https://sonar.cloud.bayer.com
+  CALANTIC_BUILD_USER: calantic-build-user@bayer.com
+  GCP_MAIN_PROJECT_ID: pbeat04006578-qa-f92a-calantic
+  JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=80 -XX:InitialRAMPercentage=50
+
+jobs:
+  service_release_build:
+    name: Release Candidate Build
+    strategy:
+      matrix:
+        include:
+          - runner: ${{ inputs.runner_type }}
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      image_name: ${{ steps.artifact.outputs.PROJECT_ARTIFACT_ID }}
+      image_tag: ${{ steps.artifact.outputs.IMAGE_TAG }}
+      image_sha256: ${{ steps.image_config.outputs.IMAGE_SHA256}}
+      sonar_project_key: ${{ steps.artifact.outputs.SONAR_PROJECT_KEY }}
+    timeout-minutes: 60
+    if: |
+      ${{ ( github.event.pull_request.merged == true || ( github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ) && github.event.pusher.name  != 'calantic-build-user' }}
+    steps:
+      - name: Capture attribution
+        run: |
+          echo "Pushed by:" ${{ github.event.pusher.name }}
+          echo "Job started by:" ${{ github.actor }}
+
+      - name: Checkout project
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.m2/repository
+          key: ${{ env.GCP_MAIN_PROJECT_ID }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ env.GCP_MAIN_PROJECT_ID }}-${{ hashFiles('**/pom.xml') }}
+
+      - name: Get workflow settings
+        run: |
+          echo "user=${{github.actor}}" > workflow_settings.properties
+          echo "branch=${{github.ref_name}}" >> workflow_settings.properties
+          echo "hash"=${{github.sha}} >> workflow_settings.properties
+          echo "is_service=${{inputs.is_service}}" >> workflow_settings.properties
+          echo "docker_image=${{inputs.docker_image}}" >> workflow_settings.properties
+          echo "custom_script_path"=${{inputs.custom_script_path}} >> workflow_settings.properties
+
+      - name: Upload workflow settings
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow_settings
+          path: workflow_settings.properties
+          retention-days: 30
+
+      - name: Authenticate with Google Cloud
+        uses: google-github-actions/auth@ba79af03959ebeac9769e648f473a284504d9193  # v2.1.10
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_KEY }}
+
+      - name: Set up Google Cloud
+        uses: google-github-actions/setup-gcloud@77e7a554d41e2ee56fc945c52dfd3f33d12def9a  # v2.1.4
+        with:
+          install_components: gsutil
+
+      - id: secrets
+        name: Load secrets
+        uses: google-github-actions/get-secretmanager-secrets@a8440875e1c2892062aef9061228d4f1af8f919b  # v2.2.3
+        with:
+          secrets: |-
+            artifactory_password:${{env.GCP_MAIN_PROJECT_ID}}/GLOBAL_artifactory_pass
+            github_build_ssh:${{env.GCP_MAIN_PROJECT_ID}}/GLOBAL_github_build_ssh
+            sonar_token:${{env.GCP_MAIN_PROJECT_ID}}/GLOBAL_sonar_token
+
+      - name: Set up Maven
+        uses: s4u/setup-maven-action@4f7fb9d9675e899ca81c6161dadbba0189a4ebb1  # v1.18.0
+        with:
+          java-version: 17
+          maven-version: 3.9.10
+          checkout-enabled: false
+          cache-enabled: false
+          settings-servers: |
+            [{
+              "id": "release",
+              "username": "${{ env.ARTIFACTORY_USER }}",
+              "password": "${{ steps.secrets.outputs.artifactory_password}}"
+            },{
+              "id": "snapshots",
+              "username": "${{ env.ARTIFACTORY_USER }}",
+              "password": "${{ steps.secrets.outputs.artifactory_password }}"
+            },{
+              "id": "remote",
+              "username": "${{ env.ARTIFACTORY_USER }}",
+              "password": "${{ steps.secrets.outputs.artifactory_password }}"
+            }]
+          settings-mirrors: |
+            [{
+              "id": "remote",
+              "name": "Maven",
+              "mirrorOf": "central",
+              "url": "https://artifactory.bayer.com/artifactory/Maven/"
+            }]
+
+      - name: Authenticate with Artifactory
+        run: docker login -u $ARTIFACTORY_USER -p ${{ steps.secrets.outputs.artifactory_password }} $ARTIFACTORY_REPO
+
+      - name: Pull required image
+        if: ${{ inputs.docker_image }}
+        run: |-
+          docker pull $ARTIFACTORY_REPO/${{ inputs.docker_image }}
+          IMAGE_NAME=$(echo "${{ inputs.docker_image }}" | cut -d':' -f1)
+          docker tag $ARTIFACTORY_REPO/${{ inputs.docker_image }} $IMAGE_NAME:v1.0
+
+      - name: Run custom script
+        if: ${{ inputs.custom_script_path}}
+        run: |
+          chmod +x ${{ inputs.custom_script_path}}
+          bash ${{ inputs.custom_script_path}}
+          chmod -x ${{ inputs.custom_script_path}}
+
+      - name: Configure git
+        env:
+          SSH_KEY: ${{ steps.secrets.outputs.github_build_ssh }}
+        run: | 
+          git config --global user.name ${{ env.CALANTIC_BUILD_USER }}
+          git config --global user.email ${{ env.CALANTIC_BUILD_USER }}
+          echo "$SSH_KEY" >> ~/git_ssh
+          chmod 600 ~/git_ssh
+          eval `ssh-agent -s`
+          ssh-add ~/git_ssh
+          ssh  -o StrictHostKeyChecking=no -T git@github.com || true
+
+      - name: Get project variables
+        id: artifact
+        run: |
+          PROJECT_VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          PROJECT_VERSION=${PROJECT_VERSION//-SNAPSHOT/}
+          PROJECT_ARTIFACT_ID=$(cd service;mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout)
+          SONAR_PROJECT_KEY=$(mvn help:evaluate -Dexpression=project.groupId -q -DforceStdout):$(mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout)
+          echo "PROJECT_VERSION=$PROJECT_VERSION" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=$PROJECT_VERSION.$RUN_TAG" >> $GITHUB_OUTPUT
+          echo "PROJECT_ARTIFACT_ID=$PROJECT_ARTIFACT_ID" >> $GITHUB_OUTPUT
+          echo "SONAR_PROJECT_KEY=$SONAR_PROJECT_KEY" >> $GITHUB_OUTPUT
+
+      - name: Maven release prepare
+        run: |
+          eval `ssh-agent -s`
+          ssh-add ~/git_ssh
+          mvn -B release:prepare -e
+
+      - name: Maven release rollback if failure
+        if: ${{ failure() }}
+        run: | 
+          eval `ssh-agent -s`
+          ssh-add ~/git_ssh
+          mvn -B release:rollback
+          mvn -B release:clean
+
+      - name: Maven release perform
+        run: |
+          eval `ssh-agent -s`
+          ssh-add ~/git_ssh
+          mvn -B release:perform -Darguments="-DskipTests=true"
+
+      - name: Build image
+        if: ${{inputs.is_service}}
+        run:
+          docker build --network host -t $ARTIFACTORY_REPO/${{ steps.artifact.outputs.PROJECT_ARTIFACT_ID }}:${{ steps.artifact.outputs.IMAGE_TAG }} --build-arg ARTIFACT_NAME=${{ steps.artifact.outputs.PROJECT_ARTIFACT_ID }} --build-arg VERSION=${{steps.artifact.outputs.PROJECT_VERSION}}  .
+
+      - name: Add latest tag
+        if: ${{inputs.is_service}}
+        run: docker tag $ARTIFACTORY_REPO/${{ steps.artifact.outputs.PROJECT_ARTIFACT_ID }}:${{ steps.artifact.outputs.IMAGE_TAG }} $ARTIFACTORY_REPO/${{ steps.artifact.outputs.PROJECT_ARTIFACT_ID }}:latest
+
+      - name: Push image to Artifactory
+        if: ${{inputs.is_service}}
+        run: docker push $ARTIFACTORY_REPO/${{ steps.artifact.outputs.PROJECT_ARTIFACT_ID }} --all-tags
+
+      - name: Output image digest
+        if: ${{ inputs.is_service }}
+        id: image_config 
+        run: |-
+          IMAGE_SHA256=$(docker inspect -f '{{.RepoDigests}}' $ARTIFACTORY_REPO/${{ steps.artifact.outputs.PROJECT_ARTIFACT_ID }}:${{ steps.artifact.outputs.IMAGE_TAG }} | cut -d':' -f2- | cut -d']' -f1 )
+          echo "IMAGE_SHA256=$IMAGE_SHA256" >> $GITHUB_OUTPUT
+
+      - name: Add image tag to summary
+        if: ${{ inputs.is_service }}
+        run: |-
+          echo "${{ steps.artifact.outputs.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload test report
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-jupiter
+          path: "**/junit-platform-events-*.xml"
+          retention-days: 30
+
+      - name: Run Sonar check
+        env:
+          SONAR_VERSION: 4.0.0.4121
+          SONAR_QUALITYGATE_WAIT: true
+          SONAR_PROJECTVERSION: 1.0
+          SONAR_SOURCEENCODING: UTF-8
+          SONAR_LANGUAGE: java
+          SONAR_JAVA_BINARIES: .
+          SONAR_TOKEN: ${{ steps.secrets.outputs.sonar_token }}
+        run: |
+          if ${{ inputs.is_service }}; then
+              export SONAR_SOURCES=service/src/main/java
+          else
+              export SONAR_SOURCES=src/main/java
+          fi
+          mvn org.sonarsource.scanner.maven:sonar-maven-plugin:$SONAR_VERSION:sonar
+
+  increment_version_on_failure:
+    #MVN release plugin increments the patch version and works off the tag. failures mean the next run will fail, because the tag was created
+    #Incrementing the patch version on failure is a safer means of recovery than deleting tags.
+    name: Increment version on failure detected
+    needs: service_release_build
+    if: ${{ failure()}}
+    runs-on: external-k8s-v2
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v3
+          
+      - name: Authenticate with Google Cloud
+        uses: google-github-actions/auth@ba79af03959ebeac9769e648f473a284504d9193  # v2.1.10
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_KEY }}
+
+      - id: secrets
+        name: Load secrets
+        uses: google-github-actions/get-secretmanager-secrets@a8440875e1c2892062aef9061228d4f1af8f919b  # v2.2.3
+        with:
+          secrets: |-
+            github_build_ssh:${{env.GCP_MAIN_PROJECT_ID}}/GLOBAL_github_build_ssh
+
+      - name: Configure git
+        env:
+          SSH_KEY: ${{ steps.secrets.outputs.github_build_ssh }}
+        run: |-
+          git config --global user.name ${{ env.CALANTIC_BUILD_USER }}
+          git config --global user.email ${{ env.CALANTIC_BUILD_USER }}
+          echo "$SSH_KEY" >> ~/git_ssh
+          chmod 600 ~/git_ssh
+          eval `ssh-agent -s`
+          ssh-add ~/git_ssh
+          ssh  -o StrictHostKeyChecking=no -T git@github.com || true
+
+      - name: Set remote origin
+        run: |-
+          eval `ssh-agent -s`
+          ssh-add ~/git_ssh
+          git remote set-url origin git@github.com:bayer-int/${{ github.event.repository.name }}.git
+          git status
+          git pull
+
+      - name: Set the next snapshot version
+        run: |-
+          PROJECT_VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "Current Version in POM: $PROJECT_VERSION"
+          mvn build-helper:parse-version  versions:set -DnewVersion=\${parsedVersion.majorVersion}.\${parsedVersion.minorVersion}.\${parsedVersion.nextIncrementalVersion}-SNAPSHOT versions:commit
+          
+      - name: Push rev'd version to main 
+        run: |- 
+          eval `ssh-agent -s`
+          ssh-add ~/git_ssh
+          find . -name 'pom.xml' | xargs git add
+          git commit -m "Incremented version to next patch version"
+          git push origin main
+
+  upload_workflow_settings:
+    name: Upload workflow settings to GCS
+    needs: service_release_build
+    uses: bayer-int/calantic-github-workflows/.github/workflows/gcs-upload.yml@main
+    secrets: inherit
+    with:
+      artifact_name: workflow_settings
+      version: ${{ needs.service_release_build.outputs.image_tag }}
+
+  upload_surefire_report:
+    name: Upload Surefire report to GCS
+    needs: service_release_build
+    uses: bayer-int/calantic-github-workflows/.github/workflows/gcs-upload.yml@main
+    secrets: inherit
+    with:
+      artifact_name: surefire-jupiter
+      version: ${{ needs.service_release_build.outputs.image_tag }}
+
+  x_ray_report:
+    name: Export Xray report
+    needs: service_release_build
+    if: ${{ inputs.is_service }}
+    uses: bayer-int/calantic-github-workflows/.github/workflows/xray-report.yml@main
+    secrets: inherit
+    with:
+      image_name: ${{ needs.service_release_build.outputs.image_name}}
+      image_tag: ${{ needs.service_release_build.outputs.image_tag}}
+      image_sha256: ${{ needs.service_release_build.outputs.image_sha256}}
+
+  upload_xray_report:
+    name: Upload Xray report to GCS
+    needs: [service_release_build, x_ray_report]
+    uses: bayer-int/calantic-github-workflows/.github/workflows/gcs-upload.yml@main
+    secrets: inherit
+    with:
+      artifact_name:  xray_report-${{ needs.service_release_build.outputs.image_name }}-${{ needs.service_release_build.outputs.image_tag }}
+      version: ${{ needs.service_release_build.outputs.image_tag }}
+
+  service_sonar_report:
+    needs: service_release_build
+    name: Generate Sonar report
+    uses: bayer-int/calantic-github-workflows/.github/workflows/sonar-report.yml@main
+    secrets: inherit
+    with:
+      sonar_project_key: ${{ needs.service_release_build.outputs.sonar_project_key }}
