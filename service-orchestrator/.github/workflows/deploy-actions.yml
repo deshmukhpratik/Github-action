@@ -11,8 +11,8 @@ on:
         type: choice
         required: false
         options:
-            - calantic-docker-dev-local
-            - calantic-docker-release-local
+            - docker-dev-local
+            - docker-release-local
       project_selection:
         description: "Name of the environment to perform deployment (matches json shorthand in deployscript)."
         type: choice
